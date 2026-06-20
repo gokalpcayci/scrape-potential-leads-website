@@ -15,6 +15,9 @@ export type BlockSubtype =
   | "unknown_block";
 export type LeadSegment = "first_site" | "redesign" | "seo_cleanup" | "trust_gap" | "deprioritized";
 export type ManualReviewStatus = "new" | "reviewing" | "qualified" | "rejected" | "contacted";
+export type ExposureLevel = "low" | "medium" | "high" | "unknown";
+export type SourceConfidence = "low" | "medium" | "high";
+export type PipelineStage = "source_lane" | "verify_fit" | "capture_evidence" | "shortlisted" | "ready_to_contact" | "parked";
 
 export type SectorCategory =
   | "GES / EPC"
@@ -53,8 +56,16 @@ export interface Lead {
   conversion_signal: TrafficSignal;
   technical_signal: TrafficSignal;
   trust_signal: TrafficSignal;
+  proof_fit_signal: TrafficSignal;
+  contactability_signal: TrafficSignal;
+  spam_exposure: ExposureLevel;
+  source_confidence: SourceConfidence;
+  opportunity_score: number;
   priority: Priority;
+  pipeline_stage: PipelineStage;
   issues_found: string[];
+  evidence_summary: string;
+  next_action: string;
   screenshot_path: string;
   calibration_anchor: string;
   manual_review_status: ManualReviewStatus;
@@ -79,4 +90,29 @@ export interface CalibrationAnchor {
   category: SectorCategory;
   signals: Record<"design" | "seo" | "conversion" | "technical" | "trust", TrafficSignal>;
   notes: string;
+}
+
+export interface SourcePack {
+  id: string;
+  title: string;
+  category: SectorCategory;
+  region: string;
+  why_it_matters: string;
+  spam_exposure: ExposureLevel;
+  buyer_value: "medium" | "high" | "very_high";
+  proof_angle: string;
+  queries: string[];
+  import_hint: string;
+}
+
+export interface ExpansionLane {
+  id: string;
+  title: string;
+  sector: string;
+  why_promising: string;
+  spam_exposure: ExposureLevel;
+  buyer_value: "medium" | "high" | "very_high";
+  proof_needed: string;
+  wait_reason: string;
+  first_queries: string[];
 }

@@ -53,27 +53,30 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { calibrationAnchors, researchQueries, sectorCategories, seedAuditRuns, seedLeads, turkeyCities } from "@/lib/lead-data";
-import { buildSearchUrl, classifyPriority, dedupeLeads, leadsToCsv, parseCsvToLeads, signalBadgeVariant } from "@/lib/lead-engine";
-import type { Lead, LeadSegment, ManualReviewStatus, Priority, TrafficSignal } from "@/lib/lead-types";
+import { calibrationAnchors, expansionLanes, researchQueries, sectorCategories, seedAuditRuns, seedLeads, sourcePacks, turkeyCities } from "@/lib/lead-data";
+import { buildSearchUrl, calculateOpportunityScore, classifyPriority, dailyActionLabel, dailyQueueScore, dedupeLeads, hydrateLead, inferPipelineStage, leadsToCsv, parseCsvToLeads, parseResearchNotesToLeads, scoreBand, signalBadgeVariant } from "@/lib/lead-engine";
+import type { ExpansionLane, Lead, LeadSegment, ManualReviewStatus, PipelineStage, Priority, SourcePack, TrafficSignal } from "@/lib/lead-types";
 import { cn, downloadText } from "@/lib/utils";
 
 const STORAGE_KEY = "energy-lead-triage:v1";
 
 const navItems = [
+  { id: "today", label: "Today", icon: Zap },
   { id: "leads", label: "Leads", icon: Building2 },
+  { id: "pipeline", label: "Pipeline", icon: History },
   { id: "discovery", label: "Discovery", icon: Search },
   { id: "audits", label: "Audits", icon: Gauge },
   { id: "calibration", label: "Calibration", icon: BadgeCheck },
   { id: "imports", label: "Imports", icon: FileUp },
   { id: "exports", label: "Exports", icon: FileDown },
+  { id: "expansion", label: "Expansion", icon: Globe2 },
   { id: "settings", label: "Settings", icon: Settings }
 ] as const;
 
 type ActiveView = (typeof navItems)[number]["id"];
 
 export function LeadTriageApp() {
-  const [activeView, setActiveView] = useState<ActiveView>("leads");
+  const [activeView, setActiveView] = useState<ActiveView>("today");
   const [leads, setLeads] = useState<Lead[]>(seedLeads);
   const [selectedLeadId, setSelectedLeadId] = useState(seedLeads[0]?.id ?? "");
   const [query, setQuery] = useState("");
@@ -81,6 +84,7 @@ export function LeadTriageApp() {
   const [priorityFilter, setPriorityFilter] = useState<Priority | "all">("all");
   const [cityFilter, setCityFilter] = useState("all");
   const [csvText, setCsvText] = useState("");
+  const [researchNotes, setResearchNotes] = useState("");
   const [researchCity, setResearchCity] = useState("Türkiye");
   const [researchCategory, setResearchCategory] = useState("GES / EPC");
   const [darkMode, setDarkMode] = useState(false);
@@ -90,10 +94,11 @@ export function LeadTriageApp() {
     const saved = window.localStorage.getItem(STORAGE_KEY);
     if (saved) {
       const parsed = JSON.parse(saved) as { leads: Lead[]; darkMode?: boolean; keepScreenshots?: boolean };
-      setLeads(parsed.leads);
+      const hydrated = parsed.leads.map((lead) => hydrateLead(lead));
+      setLeads(hydrated);
       setDarkMode(Boolean(parsed.darkMode));
       setKeepScreenshots(parsed.keepScreenshots ?? true);
-      setSelectedLeadId(parsed.leads[0]?.id ?? "");
+      setSelectedLeadId(hydrated[0]?.id ?? "");
     }
   }, []);
 
@@ -118,6 +123,8 @@ export function LeadTriageApp() {
   const metrics = useMemo(() => {
     return {
       high: leads.filter((lead) => lead.priority === "High").length,
+      aGrade: leads.filter((lead) => scoreBand(lead.opportunity_score) === "A").length,
+      lowSpam: leads.filter((lead) => lead.spam_exposure === "low").length,
       firstSite: leads.filter((lead) => lead.lead_segment === "first_site").length,
       trustGap: leads.filter((lead) => lead.lead_segment === "trust_gap").length,
       noWebsite: leads.filter((lead) => lead.website_status === "no_website").length
@@ -129,7 +136,13 @@ export function LeadTriageApp() {
       current.map((lead) => {
         if (lead.id !== id) return lead;
         const next = { ...lead, ...patch };
-        return { ...next, priority: patch.priority ?? classifyPriority(next) };
+        const opportunity_score = patch.opportunity_score ?? calculateOpportunityScore(next);
+        return {
+          ...next,
+          priority: patch.priority ?? classifyPriority(next),
+          opportunity_score,
+          pipeline_stage: patch.pipeline_stage ?? inferPipelineStage({ ...next, opportunity_score })
+        };
       })
     );
   }
@@ -142,6 +155,15 @@ export function LeadTriageApp() {
     setCsvText("");
   }
 
+  function importResearchNotes() {
+    const imported = parseResearchNotesToLeads(researchNotes);
+    const merged = dedupeLeads([...leads, ...imported]);
+    setLeads(merged);
+    setSelectedLeadId(imported[0]?.id ?? merged[0]?.id ?? "");
+    setResearchNotes("");
+    setActiveView("today");
+  }
+
   function exportCsv(scope: "all" | "filtered") {
     const rows = scope === "filtered" ? filteredLeads : leads;
     downloadText(`energy-leads-${scope}-${new Date().toISOString().slice(0, 10)}.csv`, leadsToCsv(rows));
@@ -150,17 +172,15 @@ export function LeadTriageApp() {
   function addResearchLead() {
     const now = new Date().toISOString().slice(0, 10);
     const name = `${researchCategory} research lead`;
-    const lead: Lead = {
+    const lead: Lead = hydrateLead({
       id: crypto.randomUUID(),
       business_name: name,
-      normalized_name: name.toLocaleLowerCase("tr"),
       sector_category: researchCategory as Lead["sector_category"],
       city: researchCity === "Türkiye" ? "" : researchCity,
       district: "",
       source: "research_queue",
       source_url: buildSearchUrl(`"${researchCategory}" "${researchCity}" firma`),
       website: "",
-      canonical_domain: "",
       phone: "",
       email: "",
       is_chain: false,
@@ -175,12 +195,56 @@ export function LeadTriageApp() {
       conversion_signal: "unknown",
       technical_signal: "unknown",
       trust_signal: "unknown",
-      priority: "Medium",
+      proof_fit_signal: "yellow",
+      contactability_signal: "unknown",
+      spam_exposure: "unknown",
+      source_confidence: "low",
       issues_found: [],
-      screenshot_path: "",
+      evidence_summary: "Research queue placeholder; import the real business row after manual review.",
+      next_action: "Open the source URL, find a real company, then replace this row through CSV import.",
       calibration_anchor: "Acceptable",
       manual_review_status: "new"
-    };
+    });
+    setLeads((current) => [lead, ...current]);
+    setSelectedLeadId(lead.id);
+    setActiveView("leads");
+  }
+
+  function queueSourcePack(pack: SourcePack) {
+    const now = new Date().toISOString().slice(0, 10);
+    const lead = hydrateLead({
+      id: crypto.randomUUID(),
+      business_name: `${pack.title} research batch`,
+      sector_category: pack.category,
+      city: pack.region,
+      district: "",
+      source: "research_queue",
+      source_url: buildSearchUrl(pack.queries[0]),
+      website: "",
+      phone: "",
+      email: "",
+      is_chain: false,
+      location_count: 1,
+      collected_at: now,
+      audit_date: now,
+      website_status: "unknown",
+      block_subtype: "none",
+      lead_segment: "trust_gap",
+      design_signal: "unknown",
+      seo_signal: "unknown",
+      conversion_signal: "unknown",
+      technical_signal: "unknown",
+      trust_signal: "unknown",
+      proof_fit_signal: "green",
+      contactability_signal: "unknown",
+      spam_exposure: pack.spam_exposure,
+      source_confidence: "medium",
+      issues_found: ["low_web_dev_spam_niche", "high_ticket_b2b_buyer"],
+      evidence_summary: pack.why_it_matters,
+      next_action: pack.import_hint,
+      calibration_anchor: "Acceptable",
+      manual_review_status: "new"
+    });
     setLeads((current) => [lead, ...current]);
     setSelectedLeadId(lead.id);
     setActiveView("leads");
@@ -228,6 +292,14 @@ export function LeadTriageApp() {
           </header>
 
           <div className="min-h-0 flex-1 overflow-auto p-3 md:p-5">
+            {activeView === "today" && (
+              <TodayScreen
+                leads={leads}
+                selectLead={setSelectedLeadId}
+                setActiveView={setActiveView}
+                updateLead={updateLead}
+              />
+            )}
             {activeView === "leads" && (
               <LeadsScreen
                 metrics={metrics}
@@ -245,6 +317,14 @@ export function LeadTriageApp() {
                 updateLead={updateLead}
               />
             )}
+            {activeView === "pipeline" && (
+              <PipelineScreen
+                leads={leads}
+                selectLead={setSelectedLeadId}
+                setActiveView={setActiveView}
+                updateLead={updateLead}
+              />
+            )}
             {activeView === "discovery" && (
               <DiscoveryScreen
                 researchCity={researchCity}
@@ -252,12 +332,23 @@ export function LeadTriageApp() {
                 researchCategory={researchCategory}
                 setResearchCategory={setResearchCategory}
                 addResearchLead={addResearchLead}
+                queueSourcePack={queueSourcePack}
               />
             )}
             {activeView === "audits" && <AuditsScreen keepScreenshots={keepScreenshots} setKeepScreenshots={setKeepScreenshots} />}
             {activeView === "calibration" && <CalibrationScreen />}
-            {activeView === "imports" && <ImportsScreen csvText={csvText} setCsvText={setCsvText} importCsv={importCsv} />}
+            {activeView === "imports" && (
+              <ImportsScreen
+                csvText={csvText}
+                setCsvText={setCsvText}
+                importCsv={importCsv}
+                researchNotes={researchNotes}
+                setResearchNotes={setResearchNotes}
+                importResearchNotes={importResearchNotes}
+              />
+            )}
             {activeView === "exports" && <ExportsScreen leads={leads} filteredLeads={filteredLeads} exportCsv={exportCsv} />}
+            {activeView === "expansion" && <ExpansionScreen />}
             {activeView === "settings" && <SettingsScreen darkMode={darkMode} setDarkMode={setDarkMode} keepScreenshots={keepScreenshots} setKeepScreenshots={setKeepScreenshots} />}
           </div>
         </SidebarInset>
@@ -323,8 +414,201 @@ function LeadSidebar({ activeView, setActiveView }: { activeView: ActiveView; se
   );
 }
 
+const pipelineLabels: Record<PipelineStage, string> = {
+  source_lane: "Source lane",
+  verify_fit: "Verify fit",
+  capture_evidence: "Capture evidence",
+  shortlisted: "Shortlisted",
+  ready_to_contact: "Ready to contact",
+  parked: "Parked"
+};
+
+const pipelineOrder: PipelineStage[] = ["source_lane", "verify_fit", "capture_evidence", "shortlisted", "ready_to_contact", "parked"];
+
+function nextPipelineStage(stage: PipelineStage): PipelineStage {
+  if (stage === "source_lane") return "verify_fit";
+  if (stage === "verify_fit") return "capture_evidence";
+  if (stage === "capture_evidence") return "shortlisted";
+  if (stage === "shortlisted") return "ready_to_contact";
+  return stage;
+}
+
+function PipelineScreen({ leads, selectLead, setActiveView, updateLead }: {
+  leads: Lead[];
+  selectLead: (id: string) => void;
+  setActiveView: (view: ActiveView) => void;
+  updateLead: (id: string, patch: Partial<Lead>) => void;
+}) {
+  const sortedLeads = [...leads].sort((a, b) => b.opportunity_score - a.opportunity_score);
+  const readyCount = leads.filter((lead) => lead.pipeline_stage === "ready_to_contact").length;
+  const needsEvidence = leads.filter((lead) => lead.pipeline_stage === "capture_evidence").length;
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-3">
+        <MetricCard label="Ready to contact" value={readyCount} icon={Zap} />
+        <MetricCard label="Need evidence" value={needsEvidence} icon={ClipboardList} />
+        <MetricCard label="Total active lanes" value={leads.filter((lead) => lead.pipeline_stage !== "parked").length} icon={Building2} />
+      </div>
+      <div className="grid gap-3 xl:grid-cols-3">
+        {pipelineOrder.map((stage) => {
+          const stageLeads = sortedLeads.filter((lead) => lead.pipeline_stage === stage);
+          return (
+            <Card key={stage}>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <CardTitle className="text-base">{pipelineLabels[stage]}</CardTitle>
+                  <Badge variant="outline">{stageLeads.length}</Badge>
+                </div>
+                <CardDescription>{pipelineStageHint(stage)}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {stageLeads.slice(0, 4).map((lead) => (
+                  <button
+                    key={lead.id}
+                    className="w-full rounded-lg border bg-background p-3 text-left hover:bg-accent"
+                    onClick={() => {
+                      selectLead(lead.id);
+                      setActiveView("leads");
+                    }}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold">{lead.business_name}</p>
+                        <p className="text-xs text-muted-foreground">{lead.sector_category} · {lead.city || "Türkiye"}</p>
+                      </div>
+                      <Badge variant={lead.opportunity_score >= 78 ? "green" : lead.opportunity_score >= 62 ? "yellow" : "outline"}>
+                        {scoreBand(lead.opportunity_score)} {lead.opportunity_score}
+                      </Badge>
+                    </div>
+                    <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{lead.next_action}</p>
+                    {stage !== "ready_to_contact" && stage !== "parked" && (
+                      <Button
+                        className="mt-3 w-full"
+                        size="sm"
+                        variant="outline"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          updateLead(lead.id, { pipeline_stage: nextPipelineStage(stage) });
+                        }}
+                      >
+                        Move to {pipelineLabels[nextPipelineStage(stage)]}
+                      </Button>
+                    )}
+                  </button>
+                ))}
+                {!stageLeads.length && <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No leads here yet.</p>}
+              </CardContent>
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function pipelineStageHint(stage: PipelineStage) {
+  const hints: Record<PipelineStage, string> = {
+    source_lane: "Research lanes before importing real companies.",
+    verify_fit: "Confirm the company is active and reachable.",
+    capture_evidence: "Find one concrete site gap worth mentioning.",
+    shortlisted: "Good fit; prepare a concise manual approach.",
+    ready_to_contact: "Use only reviewed, specific evidence.",
+    parked: "Avoid distraction or low-fit outreach."
+  };
+  return hints[stage];
+}
+
+function TodayScreen({ leads, selectLead, setActiveView, updateLead }: {
+  leads: Lead[];
+  selectLead: (id: string) => void;
+  setActiveView: (view: ActiveView) => void;
+  updateLead: (id: string, patch: Partial<Lead>) => void;
+}) {
+  const queue = leads
+    .filter((lead) => lead.pipeline_stage !== "parked" && lead.manual_review_status !== "rejected" && lead.manual_review_status !== "contacted")
+    .sort((a, b) => dailyQueueScore(b) - dailyQueueScore(a))
+    .slice(0, 10);
+  const ready = queue.filter((lead) => lead.pipeline_stage === "ready_to_contact").length;
+  const evidence = queue.filter((lead) => lead.pipeline_stage === "capture_evidence" || lead.pipeline_stage === "shortlisted").length;
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <section className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-3">
+          <MetricCard label="Today's queue" value={queue.length} icon={Zap} />
+          <MetricCard label="Need evidence" value={evidence} icon={ClipboardList} />
+          <MetricCard label="Ready checks" value={ready} icon={CheckCircle2} />
+        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Today Queue</CardTitle>
+            <CardDescription>Work top to bottom: verify fit, capture one real gap, then shortlist.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {queue.map((lead, index) => (
+              <div key={lead.id} className="rounded-lg border bg-background p-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="outline">#{index + 1}</Badge>
+                      <Badge variant={lead.opportunity_score >= 78 ? "green" : lead.opportunity_score >= 62 ? "yellow" : "outline"}>{scoreBand(lead.opportunity_score)} {lead.opportunity_score}</Badge>
+                      <Badge variant={lead.spam_exposure === "low" ? "green" : lead.spam_exposure === "medium" ? "yellow" : "red"}>{lead.spam_exposure} spam</Badge>
+                      <Badge variant="outline">{pipelineLabels[lead.pipeline_stage]}</Badge>
+                    </div>
+                    <p className="mt-2 font-semibold">{lead.business_name}</p>
+                    <p className="text-sm text-muted-foreground">{lead.sector_category} · {lead.city || "Türkiye"}</p>
+                    <p className="mt-2 text-sm leading-6 text-muted-foreground">{lead.next_action}</p>
+                  </div>
+                  <div className="flex shrink-0 flex-col gap-2 lg:w-44">
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        selectLead(lead.id);
+                        setActiveView("leads");
+                      }}
+                    >
+                      <ClipboardList />
+                      Open lead
+                    </Button>
+                    {lead.source_url && lead.source_url !== "manual import" && (
+                      <Button variant="outline" size="sm" asChild>
+                        <a href={lead.source_url} target="_blank" rel="noreferrer">
+                          <Search />
+                          Source
+                        </a>
+                      </Button>
+                    )}
+                    {lead.pipeline_stage !== "ready_to_contact" && (
+                      <Button variant="outline" size="sm" onClick={() => updateLead(lead.id, { pipeline_stage: nextPipelineStage(lead.pipeline_stage) })}>
+                        Next stage
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+            {!queue.length && <p className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">No active queue items. Add source lanes from Discovery or import reviewed CSV rows.</p>}
+          </CardContent>
+        </Card>
+      </section>
+      <Card>
+        <CardHeader>
+          <CardTitle>Operating Rule</CardTitle>
+          <CardDescription>Small batches beat broad scraping.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm leading-6 text-muted-foreground">
+          <p>Do not chase volume first. Queue 10, verify 5, capture evidence for 3, then contact only the strongest 1 or 2.</p>
+          <p>Best leads have high ticket value, low generic web-design spam exposure, public proof gaps, and reachable business contact information.</p>
+          <p>When a lead only has a vague issue, keep it in evidence capture. The outreach edge is a concrete observation, not a generic redesign pitch.</p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function LeadsScreen(props: {
-  metrics: { high: number; firstSite: number; trustGap: number; noWebsite: number };
+  metrics: { high: number; aGrade: number; lowSpam: number; firstSite: number; trustGap: number; noWebsite: number };
   leads: Lead[];
   selectedLead?: Lead;
   query: string;
@@ -343,8 +627,8 @@ function LeadsScreen(props: {
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
       <section className="min-w-0 space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <MetricCard label="High priority" value={metrics.high} icon={Zap} />
-          <MetricCard label="First-site leads" value={metrics.firstSite} icon={Globe2} />
+          <MetricCard label="A-grade edge" value={metrics.aGrade} icon={Zap} />
+          <MetricCard label="Low spam lanes" value={metrics.lowSpam} icon={ShieldCheck} />
           <MetricCard label="Trust gaps" value={metrics.trustGap} icon={ShieldCheck} />
           <MetricCard label="No website" value={metrics.noWebsite} icon={Info} />
         </div>
@@ -393,8 +677,9 @@ function LeadsScreen(props: {
               <TableHeader>
                 <TableRow>
                   <TableHead>Business</TableHead>
+                  <TableHead>Edge</TableHead>
                   <TableHead>Segment</TableHead>
-                  <TableHead>Signals</TableHead>
+                  <TableHead className="hidden md:table-cell">Signals</TableHead>
                   <TableHead className="hidden lg:table-cell">Source</TableHead>
                   <TableHead className="hidden lg:table-cell">Review</TableHead>
                 </TableRow>
@@ -407,13 +692,20 @@ function LeadsScreen(props: {
                       <div className="text-xs text-muted-foreground">{lead.sector_category} · {lead.city || "Türkiye"} {lead.district && `· ${lead.district}`}</div>
                     </TableCell>
                     <TableCell>
+                      <div className="flex items-center gap-2">
+                        <Badge variant={lead.opportunity_score >= 78 ? "green" : lead.opportunity_score >= 62 ? "yellow" : "outline"}>{scoreBand(lead.opportunity_score)}</Badge>
+                        <span className="text-sm font-semibold tabular-nums">{lead.opportunity_score}</span>
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">{lead.spam_exposure} spam</div>
+                    </TableCell>
+                    <TableCell>
                       <div className="flex flex-wrap gap-1">
                         <Badge variant={lead.priority === "High" ? "red" : lead.priority === "Medium" ? "yellow" : "green"}>{lead.priority}</Badge>
                         <Badge variant="outline">{lead.lead_segment}</Badge>
                         {lead.is_chain && <Badge variant="blue">{lead.location_count} locations</Badge>}
                       </div>
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="hidden md:table-cell">
                       <SignalRow lead={lead} />
                     </TableCell>
                     <TableCell className="hidden lg:table-cell">
@@ -453,10 +745,44 @@ function LeadDetail({ lead, updateLead }: { lead: Lead; updateLead: (id: string,
     <aside className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle>{lead.business_name}</CardTitle>
-          <CardDescription>{lead.sector_category} · {lead.city || "Türkiye"} {lead.district && `· ${lead.district}`}</CardDescription>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle>{lead.business_name}</CardTitle>
+              <CardDescription>{lead.sector_category} · {lead.city || "Türkiye"} {lead.district && `· ${lead.district}`}</CardDescription>
+            </div>
+            <Badge variant={lead.opportunity_score >= 78 ? "green" : lead.opportunity_score >= 62 ? "yellow" : "outline"}>
+              {scoreBand(lead.opportunity_score)} {lead.opportunity_score}
+            </Badge>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div className="grid grid-cols-3 gap-2">
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <p className="text-xs text-muted-foreground">Spam exposure</p>
+              <p className="mt-1 text-sm font-semibold">{lead.spam_exposure}</p>
+            </div>
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <p className="text-xs text-muted-foreground">Proof fit</p>
+              <p className="mt-1 text-sm font-semibold">{lead.proof_fit_signal}</p>
+            </div>
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <p className="text-xs text-muted-foreground">Contact</p>
+              <p className="mt-1 text-sm font-semibold">{lead.contactability_signal}</p>
+            </div>
+          </div>
+
+          <div>
+            <Label>Pipeline stage</Label>
+            <Select value={lead.pipeline_stage} onValueChange={(pipeline_stage) => updateLead(lead.id, { pipeline_stage: pipeline_stage as PipelineStage })}>
+              <SelectTrigger className="mt-2"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {pipelineOrder.map((stage) => (
+                  <SelectItem key={stage} value={stage}>{pipelineLabels[stage]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
           <div className="rounded-lg border bg-muted/30 p-3">
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">Website status</span>
@@ -478,6 +804,16 @@ function LeadDetail({ lead, updateLead }: { lead: Lead; updateLead: (id: string,
             <div className="mt-2 flex flex-wrap gap-1.5">
               {lead.issues_found.map((issue) => <Badge key={issue} variant="outline">{issue}</Badge>)}
             </div>
+          </div>
+
+          <div className="rounded-lg border bg-background p-3">
+            <Label>Evidence</Label>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">{lead.evidence_summary}</p>
+          </div>
+
+          <div className="rounded-lg border bg-background p-3">
+            <Label>Next action</Label>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">{lead.next_action}</p>
           </div>
 
           <div className="grid gap-2 text-sm">
@@ -515,12 +851,13 @@ function LeadDetail({ lead, updateLead }: { lead: Lead; updateLead: (id: string,
   );
 }
 
-function DiscoveryScreen({ researchCity, setResearchCity, researchCategory, setResearchCategory, addResearchLead }: {
+function DiscoveryScreen({ researchCity, setResearchCity, researchCategory, setResearchCategory, addResearchLead, queueSourcePack }: {
   researchCity: string;
   setResearchCity: (value: string) => void;
   researchCategory: string;
   setResearchCategory: (value: string) => void;
   addResearchLead: () => void;
+  queueSourcePack: (pack: SourcePack) => void;
 }) {
   const generatedQuery = `"${researchCategory}" "${researchCity}" firma`;
   return (
@@ -562,6 +899,11 @@ function DiscoveryScreen({ researchCity, setResearchCity, researchCategory, setR
                   <p className="text-xs text-muted-foreground">Generated review URL</p>
                   <a className="mt-1 block truncate text-sm underline underline-offset-4" href={buildSearchUrl(generatedQuery)} target="_blank" rel="noreferrer">{buildSearchUrl(generatedQuery)}</a>
                 </div>
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {sourcePacks.map((pack) => (
+                    <SourcePackCard key={pack.id} pack={pack} queueSourcePack={queueSourcePack} />
+                  ))}
+                </div>
               </TabsContent>
               <TabsContent value="osm">
                 <ZeroCostNotice title="OSM discovery adapter" body="The CLI stub is included for free Overpass discovery. Coverage for energy-sector B2B companies can be sparse, so treat OSM as one source, not the source." />
@@ -574,8 +916,8 @@ function DiscoveryScreen({ researchCity, setResearchCity, researchCategory, setR
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>Search Pack</CardTitle>
-            <CardDescription>Review queries for energy-sector businesses in Türkiye.</CardDescription>
+            <CardTitle>Quick Queries</CardTitle>
+            <CardDescription>Open review URLs, then import only businesses with clear fit.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
             {researchQueries.map((query) => (
@@ -587,6 +929,40 @@ function DiscoveryScreen({ researchCity, setResearchCity, researchCategory, setR
           </CardContent>
         </Card>
       </div>
+    </div>
+  );
+}
+
+function SourcePackCard({ pack, queueSourcePack }: { pack: SourcePack; queueSourcePack: (pack: SourcePack) => void }) {
+  return (
+    <div className="rounded-lg border bg-background p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold">{pack.title}</p>
+          <p className="text-xs text-muted-foreground">{pack.region}</p>
+        </div>
+        <Badge variant={pack.spam_exposure === "low" ? "green" : pack.spam_exposure === "medium" ? "yellow" : "red"}>
+          {pack.spam_exposure} spam
+        </Badge>
+      </div>
+      <p className="mt-3 text-sm leading-6 text-muted-foreground">{pack.why_it_matters}</p>
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        <Badge variant="outline">{pack.buyer_value} value</Badge>
+        <Badge variant="outline">{pack.category}</Badge>
+      </div>
+      <div className="mt-3 space-y-1.5">
+        {pack.queries.map((query) => (
+          <a key={query} className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-2.5 py-1.5 text-xs hover:bg-accent" href={buildSearchUrl(query)} target="_blank" rel="noreferrer">
+            <span className="truncate">{query}</span>
+            <Search className="size-3.5 shrink-0 text-muted-foreground" />
+          </a>
+        ))}
+      </div>
+      <div className="mt-3 rounded-md bg-muted/40 p-2 text-xs leading-5 text-muted-foreground">{pack.import_hint}</div>
+      <Button className="mt-3 w-full" size="sm" onClick={() => queueSourcePack(pack)}>
+        <Sparkles />
+        Queue this lane
+      </Button>
     </div>
   );
 }
@@ -658,24 +1034,80 @@ function CalibrationScreen() {
   );
 }
 
-function ImportsScreen({ csvText, setCsvText, importCsv }: { csvText: string; setCsvText: (value: string) => void; importCsv: () => void }) {
+function ImportsScreen({
+  csvText,
+  setCsvText,
+  importCsv,
+  researchNotes,
+  setResearchNotes,
+  importResearchNotes
+}: {
+  csvText: string;
+  setCsvText: (value: string) => void;
+  importCsv: () => void;
+  researchNotes: string;
+  setResearchNotes: (value: string) => void;
+  importResearchNotes: () => void;
+}) {
+  const parsedPreview = researchNotes.trim() ? parseResearchNotesToLeads(researchNotes).slice(0, 5) : [];
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>CSV Import</CardTitle>
-        <CardDescription>Paste manually reviewed rows from directories, chamber listings, spreadsheets, or browser sessions.</CardDescription>
+        <CardTitle>Imports</CardTitle>
+        <CardDescription>Turn reviewed research into structured, deduped leads without paid APIs.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <Textarea value={csvText} onChange={(event) => setCsvText(event.target.value)} className="min-h-[300px] font-mono text-xs" placeholder="business_name,sector_category,city,district,website,phone,email,source_url" />
-        <div className="flex flex-wrap gap-2">
-          <Button onClick={importCsv} disabled={!csvText.trim()}>
-            <Upload />
-            Import and dedupe
-          </Button>
-          <Button variant="outline" onClick={() => setCsvText("business_name,sector_category,city,district,website,phone,email,source_url\nVoltaj Jeneratör UPS,Generator / UPS,Ankara,Ostim,,+90 312 000 00 00,,manual")}>
-            Load example
-          </Button>
-        </div>
+        <Tabs defaultValue="notes">
+          <TabsList>
+            <TabsTrigger value="notes">Research notes</TabsTrigger>
+            <TabsTrigger value="csv">CSV</TabsTrigger>
+          </TabsList>
+          <TabsContent value="notes" className="space-y-4">
+            <Textarea
+              value={researchNotes}
+              onChange={(event) => setResearchNotes(event.target.value)}
+              className="min-h-[260px] font-mono text-xs"
+              placeholder={"One lead per line. Examples:\nMarmara Elektrik Taahhüt | İstanbul | http://example.com | +90 216 000 00 00\nVoltaj Jeneratör UPS; Ankara; +90 312 000 00 00\nGES EPC Konya Firma www.example.com info@example.com"}
+            />
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={importResearchNotes} disabled={!researchNotes.trim()}>
+                <Upload />
+                Import parsed leads
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setResearchNotes("OSB Elektrik Taahhüt | Kocaeli | www.osbelektrik.example | +90 262 000 00 00\nAnkara Jeneratör UPS Servis; Ankara; servis@example.com; +90 312 000 00 00\nKonya GES EPC Firma www.konyages.example")}
+              >
+                Load example
+              </Button>
+            </div>
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <p className="text-sm font-medium">Parsed preview</p>
+              <div className="mt-3 space-y-2">
+                {parsedPreview.map((lead) => (
+                  <div key={lead.id} className="rounded-md border bg-background p-2 text-sm">
+                    <div className="font-medium">{lead.business_name}</div>
+                    <div className="text-xs text-muted-foreground">{lead.sector_category} · {lead.city || "Türkiye"} · {lead.website || "no website"}</div>
+                  </div>
+                ))}
+                {!parsedPreview.length && <p className="text-sm text-muted-foreground">Paste notes to preview parsed candidates.</p>}
+              </div>
+            </div>
+          </TabsContent>
+          <TabsContent value="csv" className="space-y-4">
+            <Textarea value={csvText} onChange={(event) => setCsvText(event.target.value)} className="min-h-[300px] font-mono text-xs" placeholder="business_name,sector_category,city,district,website,phone,email,source_url,spam_exposure,proof_fit_signal,pipeline_stage,evidence_summary,next_action" />
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={importCsv} disabled={!csvText.trim()}>
+                <Upload />
+                Import and dedupe
+              </Button>
+              <Button variant="outline" onClick={() => setCsvText("business_name,sector_category,city,district,website,phone,email,source_url,spam_exposure,proof_fit_signal,pipeline_stage,evidence_summary,next_action\nVoltaj Jeneratör UPS,Generator / UPS,Ankara,Ostim,,+90 312 000 00 00,,manual,low,yellow,verify_fit,No website found after manual directory review,Confirm active business before outreach")}>
+                Load example
+              </Button>
+            </div>
+          </TabsContent>
+        </Tabs>
       </CardContent>
     </Card>
   );
@@ -702,6 +1134,64 @@ function ExportsScreen({ leads, filteredLeads, exportCsv }: { leads: Lead[]; fil
       </Card>
       <ZeroCostNotice title="Review-first export" body="CSV export is for manual review and prioritization. The app does not send messages or create outreach automatically." />
     </div>
+  );
+}
+
+function ExpansionScreen() {
+  return (
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <section className="grid gap-3 lg:grid-cols-2">
+        {expansionLanes.map((lane) => (
+          <ExpansionLaneCard key={lane.id} lane={lane} />
+        ))}
+      </section>
+      <Card>
+        <CardHeader>
+          <CardTitle>Expansion Rule</CardTitle>
+          <CardDescription>Broaden only when the energy workflow produces repeatable qualified leads.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm leading-6 text-muted-foreground">
+          <p>Keep energy as the proof-first wedge until source packs consistently produce reviewed, high-fit leads.</p>
+          <p>Only expand into sectors where buyers are high-value, local trust matters, and generic web-design spam is less intense.</p>
+          <p>Restaurants, cafes, dentists, gyms, and salons stay parked unless we find a very specific sub-niche with a better angle.</p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function ExpansionLaneCard({ lane }: { lane: ExpansionLane }) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <CardTitle className="text-base">{lane.title}</CardTitle>
+            <CardDescription>{lane.sector}</CardDescription>
+          </div>
+          <Badge variant={lane.spam_exposure === "low" ? "green" : lane.spam_exposure === "medium" ? "yellow" : "red"}>
+            {lane.spam_exposure} spam
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm leading-6 text-muted-foreground">{lane.why_promising}</p>
+        <div className="flex flex-wrap gap-1.5">
+          <Badge variant="outline">{lane.buyer_value} value</Badge>
+          <Badge variant="outline">parked</Badge>
+        </div>
+        <div className="rounded-md bg-muted/40 p-2 text-xs leading-5 text-muted-foreground">{lane.proof_needed}</div>
+        <div className="rounded-md border p-2 text-xs leading-5 text-muted-foreground">{lane.wait_reason}</div>
+        <div className="space-y-1.5">
+          {lane.first_queries.map((query) => (
+            <a key={query} className="flex items-center justify-between gap-2 rounded-md border bg-background px-2.5 py-1.5 text-xs hover:bg-accent" href={buildSearchUrl(query)} target="_blank" rel="noreferrer">
+              <span className="truncate">{query}</span>
+              <Search className="size-3.5 shrink-0 text-muted-foreground" />
+            </a>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
