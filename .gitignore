@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+dist
+.env*
+*.tsbuildinfo
+data/screenshots
+data/exports
+playwright-report
+test-results
